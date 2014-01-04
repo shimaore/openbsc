@@ -106,7 +106,7 @@ struct rtp_x_hdr {
 #define RTP_VERSION	2
 
 /* decode an rtp frame and create a new buffer with payload */
-static int rtp_decode(struct msgb *msg, uint32_t callref, struct msgb **data)
+static int rtp_decode(struct msgb *msg, uint32_t callref, struct msgb **data, int msg_type)
 {
 	struct msgb *new_msg;
 	struct gsm_data_frame *frame;
@@ -114,8 +114,8 @@ static int rtp_decode(struct msgb *msg, uint32_t callref, struct msgb **data)
 	struct rtp_x_hdr *rtpxh;
 	uint8_t *payload;
 	int payload_len;
-	int msg_type;
 	int x_len;
+	int amr = 0;
 
 	if (msg->len < 12) {
 		DEBUGPC(DLMUX, "received RTP frame too short (len = %d)\n",
@@ -164,34 +164,73 @@ static int rtp_decode(struct msgb *msg, uint32_t callref, struct msgb **data)
 		}
 	}
 
-	switch (rtph->payload_type) {
-	case RTP_PT_GSM_FULL:
-		msg_type = GSM_TCHF_FRAME;
+	/* If no explicit frame type is given, select frame type from
+	 * payload type. */
+	if (!msg_type) {
+		switch (rtph->payload_type) {
+		case RTP_PT_GSM_FULL:
+			msg_type = GSM_TCHF_FRAME;
+			break;
+		case RTP_PT_GSM_EFR:
+			msg_type = GSM_TCHF_FRAME_EFR;
+			break;
+		case RTP_PT_GSM_HALF:
+			msg_type = GSM_TCHH_FRAME;
+			break;
+		case RTP_PT_AMR:
+			msg_type = GSM_TCH_FRAME_AMR;
+			break;
+		default:
+			DEBUGPC(DLMUX, "received RTP frame with unknown "
+				"payload type %d\n", rtph->payload_type);
+			return -EINVAL;
+		}
+	}
+
+	switch (msg_type) {
+	case GSM_TCHF_FRAME:
 		if (payload_len != 33) {
 			DEBUGPC(DLMUX, "received RTP full rate frame with "
-				"payload length != 32 (len = %d)\n",
+				"payload length != 33 (len = %d)\n",
 				payload_len);
 			return -EINVAL;
 		}
 		break;
-	case RTP_PT_GSM_EFR:
-		msg_type = GSM_TCHF_FRAME_EFR;
+	case GSM_TCHF_FRAME_EFR:
+		if (payload_len != 31) {
+			DEBUGPC(DLMUX, "received RTP extended full rate frame "
+				"with payload length != 31 (len = %d)\n",
+				payload_len);
+			return -EINVAL;
+		}
+		break;
+	case GSM_TCHH_FRAME:
+		if (payload_len != 15) {
+			DEBUGPC(DLMUX, "received RTP half rate frame with "
+				"payload length != 15 (len = %d)\n",
+				payload_len);
+			return -EINVAL;
+		}
+		break;
+	case GSM_TCH_FRAME_AMR:
+		amr = 1;
 		break;
 	default:
-		DEBUGPC(DLMUX, "received RTP frame with unknown payload "
-			"type %d\n", rtph->payload_type);
+		DEBUGPC(DLMUX, "Forced message type %x unknown\n", msg_type);
 		return -EINVAL;
 	}
 
-	new_msg = msgb_alloc(sizeof(struct gsm_data_frame) + payload_len,
+	new_msg = msgb_alloc(sizeof(struct gsm_data_frame) + payload_len + amr,
 				"GSM-DATA");
 	if (!new_msg)
 		return -ENOMEM;
 	frame = (struct gsm_data_frame *)(new_msg->data);
 	frame->msg_type = msg_type;
 	frame->callref = callref;
-	memcpy(frame->data, payload, payload_len);
-	msgb_put(new_msg, sizeof(struct gsm_data_frame) + payload_len);
+	if (amr)
+		frame->data[0] = payload_len;
+	memcpy(frame->data + amr, payload, payload_len);
+	msgb_put(new_msg, sizeof(struct gsm_data_frame) + amr + payload_len);
 
 	*data = new_msg;
 	return 0;
@@ -212,6 +251,20 @@ static void tv_difference(struct timeval *diff, const struct timeval *from,
 	diff->tv_sec = to->tv_sec - from->tv_sec;
 }
 
+/* add sec,usec to tv */
+static void tv_add(struct timeval *tv, int sec, int usec)
+{
+
+	if (usec < 0)
+		usec += 1000000;
+	tv->tv_sec += sec;
+	tv->tv_usec += usec;
+	if (tv->tv_usec >= 1000000) {
+		tv->tv_sec++;
+		tv->tv_usec -= 1000000;
+	}
+}
+
 /*! \brief encode and send a rtp frame
  *  \param[in] rs RTP socket through which we shall send
  *  \param[in] frame GSM RTP frame to be sent
@@ -224,6 +277,11 @@ int rtp_send_frame(struct rtp_socket *rs, struct gsm_data_frame *frame)
 	int payload_type;
 	int payload_len;
 	int duration; /* in samples */
+	uint8_t dynamic_pt = 0;
+	int amr = 0;
+
+	if (rs->rx_action == RTP_RECV_L4)
+		dynamic_pt = rs->receive.payload_type;
 
 	if (rs->tx_action != RTP_SEND_DOWNSTREAM) {
 		/* initialize sequences */
@@ -231,18 +289,47 @@ int rtp_send_frame(struct rtp_socket *rs, struct gsm_data_frame *frame)
 		rs->transmit.ssrc = rand();
 		rs->transmit.sequence = random();
 		rs->transmit.timestamp = random();
+		gettimeofday(&rs->transmit.last_tv, NULL);
 	}
 
 	switch (frame->msg_type) {
 	case GSM_TCHF_FRAME:
+		if ((frame->data[0] >> 4) != 0xd)
+			goto bfi;
 		payload_type = RTP_PT_GSM_FULL;
 		payload_len = 33;
 		duration = 160;
 		break;
 	case GSM_TCHF_FRAME_EFR:
-		payload_type = RTP_PT_GSM_EFR;
+		if ((frame->data[0] >> 4) != 0xc)
+			goto bfi;
+		payload_type = (dynamic_pt) ? : RTP_PT_GSM_EFR;
 		payload_len = 31;
 		duration = 160;
+		break;
+	case GSM_TCHH_FRAME:
+		if ((frame->data[0] & 0xf0) != 0x00)
+			goto bfi;
+		payload_type = (dynamic_pt) ? : RTP_PT_GSM_HALF;
+		payload_len = 15;
+		duration = 160;
+		break;
+	case GSM_TCH_FRAME_AMR:
+		if ((frame->data[2] & 0x04) != 0x04)
+			goto bfi;
+		payload_type = (dynamic_pt) ? : RTP_PT_AMR;
+		payload_len = frame->data[0];
+		duration = 160;
+		amr = 1;
+		break;
+	case GSM_BAD_FRAME:
+bfi:
+		/* in case of a bad frame, just count and drop packt */
+		payload_type = 0;
+		payload_len = 0;
+		duration = 160;
+		rs->transmit.timestamp += duration;
+		rs->transmit.sequence++;
 		break;
 	default:
 		DEBUGPC(DLMUX, "unsupported message type %d\n",
@@ -256,20 +343,32 @@ int rtp_send_frame(struct rtp_socket *rs, struct gsm_data_frame *frame)
 
 		gettimeofday(&tv, NULL);
 		tv_difference(&tv_diff, &rs->transmit.last_tv, &tv);
-		rs->transmit.last_tv = tv;
+		tv_add(&rs->transmit.last_tv, 0, 20000);
 
 		usec_diff = tv_diff.tv_sec * 1000000 + tv_diff.tv_usec;
-		frame_diff = (usec_diff / 20000);
+		frame_diff = ((usec_diff + 10000) / 20000); /* round */
 
-		if (abs(frame_diff) > 1) {
+		if (abs(frame_diff - 1) > 1) {
 			long int frame_diff_excess = frame_diff - 1;
+			long int sample_diff_excess = frame_diff_excess * duration;
 
+			/* correct last_tv */
+			tv_add(&rs->transmit.last_tv, sample_diff_excess / 8000,
+				(sample_diff_excess % 8000) * 125);
+			/* drop frame, if time stamp is in the past */
+			if (frame_diff_excess < 0)
+				return 0;
 			LOGP(DLMUX, LOGL_NOTICE,
-				"Correcting frame difference of %ld frames\n", frame_diff_excess);
+				"Correcting timestamp difference of %ld frames "
+				"(to %s)\n", frame_diff_excess,
+				(rs->rx_action == RTP_RECV_L4) ? "app" : "BTS");
 			rs->transmit.sequence += frame_diff_excess;
-			rs->transmit.timestamp += frame_diff_excess * duration;
+			rs->transmit.timestamp += sample_diff_excess;
 		}
 	}
+
+	if (frame->msg_type == GSM_BAD_FRAME)
+		return 0;
 
 	msg = msgb_alloc(sizeof(struct rtp_hdr) + payload_len, "RTP-GSM-FULL");
 	if (!msg)
@@ -285,7 +384,7 @@ int rtp_send_frame(struct rtp_socket *rs, struct gsm_data_frame *frame)
 	rtph->timestamp = htonl(rs->transmit.timestamp);
 	rs->transmit.timestamp += duration;
 	rtph->ssrc = htonl(rs->transmit.ssrc);
-	memcpy(msg->data + sizeof(struct rtp_hdr), frame->data, payload_len);
+	memcpy(msg->data + sizeof(struct rtp_hdr), frame->data + amr, payload_len);
 	msgb_put(msg, sizeof(struct rtp_hdr) + payload_len);
 	msgb_enqueue(&rss->tx_queue, msg);
 	rss->bfd.when |= BSC_FD_WRITE;
@@ -397,10 +496,8 @@ static int rtp_socket_read(struct rtp_socket *rs, struct rtp_sub_socket *rss)
 		return -ENOMEM;
 
 	rc = read(rss->bfd.fd, msg->data, RTP_ALLOC_SIZE);
-	if (rc <= 0) {
-		rss->bfd.when &= ~BSC_FD_READ;
+	if (rc <= 0)
 		return rc;
-	}
 
 	msgb_put(msg, rc);
 
@@ -426,7 +523,7 @@ static int rtp_socket_read(struct rtp_socket *rs, struct rtp_sub_socket *rss)
 		other_rss->bfd.when |= BSC_FD_WRITE;
 		break;
 
-	case RTP_RECV_UPSTREAM:
+	case RTP_RECV_UPSTREAM: /* from BTS to application */
 		if (!rs->receive.callref || !rs->receive.net) {
 			rc = -EIO;
 			goto out_free;
@@ -448,11 +545,30 @@ static int rtp_socket_read(struct rtp_socket *rs, struct rtp_sub_socket *rss)
 			rc = -EINVAL;
 			goto out_free;
 		}
-		rc = rtp_decode(msg, rs->receive.callref, &new_msg);
+		rc = rtp_decode(msg, rs->receive.callref, &new_msg, 0);
 		if (rc < 0)
 			goto out_free;
 		msgb_free(msg);
 		trau_tx_to_mncc(rs->receive.net, new_msg);
+		break;
+
+	case RTP_RECV_L4: /* from L4 */
+		if (!rs->receive.callref || !rs->receive.net) {
+			rc = -EIO;
+			goto out_free;
+		}
+		if (rss->bfd.priv_nr != RTP_PRIV_RTP) {
+			rc = ENOTSUP;
+			goto out_free;
+		}
+		rc = rtp_decode(msg, rs->receive.callref, &new_msg,
+			rs->receive.msg_type);
+		if (rc < 0)
+			goto out_free;
+		msgb_free(msg);
+		tch_frame_down(rs->receive.net, rs->receive.callref,
+			(struct gsm_data_frame *) new_msg->data);
+		msgb_free(new_msg);
 		break;
 
 	case RTP_NONE: /* if socket exists, but disabled by app */

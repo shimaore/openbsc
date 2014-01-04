@@ -6,6 +6,7 @@
 #include <osmocom/gsm/protocol/gsm_04_08.h>
 
 #include <openbsc/meas_rep.h>
+#include <openbsc/mncc.h>
 
 struct msgb;
 struct gsm_bts;
@@ -13,6 +14,7 @@ struct gsm_subscriber;
 struct gsm_network;
 struct gsm_trans;
 struct gsm_subscriber_connection;
+struct amr_multirate_conf;
 
 #define GSM48_ALLOC_SIZE	2048
 #define GSM48_ALLOC_HEADROOM	256
@@ -74,5 +76,9 @@ void gsm48_lchan2chan_desc(struct gsm48_chan_desc *cd,
 
 void release_security_operation(struct gsm_subscriber_connection *conn);
 void allocate_security_operation(struct gsm_subscriber_connection *conn);
+
+int tch_frame_down(struct gsm_network *net, uint32_t callref, struct gsm_data_frame *data);
+
+int gsm48_multirate_config(uint8_t *lv, struct amr_multirate_conf *mr, int ms);
 
 #endif

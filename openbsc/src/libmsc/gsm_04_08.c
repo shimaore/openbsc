@@ -79,6 +79,29 @@ struct gsm_lai {
 	uint16_t lac;
 };
 
+static int apply_codec_restrictions(struct gsm_bts *bts,
+	struct gsm_mncc_bearer_cap *bcap)
+{
+	int i, j;
+
+	/* remove unsupported speech versions from list */
+	for (i = 0, j = 0; bcap->speech_ver[i] >= 0; i++) {
+		if (bcap->speech_ver[i] == 0)
+			bcap->speech_ver[j++] = 0;
+		if (bcap->speech_ver[i] == 2 && bts->codec.efr)
+			bcap->speech_ver[j++] = 2;
+		if (bcap->speech_ver[i] == 4 && bts->codec.afs)
+			bcap->speech_ver[j++] = 4;
+		if (bcap->speech_ver[i] == 1 && bts->codec.hr)
+			bcap->speech_ver[j++] = 1;
+		if (bcap->speech_ver[i] == 5 && bts->codec.ahs)
+			bcap->speech_ver[j++] = 5;
+	}
+	bcap->speech_ver[j] = -1;
+
+	return 0;
+}
+
 static uint32_t new_callref = 0x80000001;
 
 void cc_tx_to_mncc(struct gsm_network *net, struct msgb *msg)
@@ -1305,8 +1328,15 @@ void _gsm48_cc_trans_free(struct gsm_trans *trans)
 	}
 	if (trans->cc.state != GSM_CSTATE_NULL)
 		new_cc_state(trans, GSM_CSTATE_NULL);
+	/* Be sure to unmap upstream traffic for our callref only. */
 	if (trans->conn)
-		trau_mux_unmap(&trans->conn->lchan->ts->e1_link, trans->callref);
+		trau_mux_unmap(&trans->conn->lchan->ts->e1_link, trans->callref_keep);
+
+	/* free L4 RTP socket */
+	if (trans->cc.rs) {
+		rtp_socket_free(trans->cc.rs);
+		trans->cc.rs = NULL;
+	}
 }
 
 static int gsm48_cc_tx_setup(struct gsm_trans *trans, void *arg);
@@ -1424,6 +1454,7 @@ static int switch_for_handover(struct gsm_lchan *old_lchan,
 		new_rs->receive = old_rs->receive;
 		break;
 	case RTP_NONE:
+	case RTP_RECV_L4:
 		break;
 	}
 
@@ -1630,6 +1661,136 @@ static int tch_recv_mncc(struct gsm_network *net, uint32_t callref, int enable)
 	return 0;
 }
 
+/* handle RTP requests of L4 */
+static int mncc_rtp(struct gsm_network *net, uint32_t callref, struct gsm_mncc_rtp *mncc)
+{
+	struct rtp_socket *rs;
+	struct gsm_trans *trans;
+	int rc;
+
+	/* Find callref */
+	trans = trans_find_by_callref(net, callref);
+	if (!trans) {
+		LOGP(DCC, LOGL_ERROR, "Unknown transaction for callref=%d\n", callref);
+		return -EINVAL;
+	}
+
+	rs = trans->cc.rs;
+
+	switch (mncc->msg_type) {
+	case MNCC_RTP_CREATE:
+		/* use RTP instead of MNCC socket, for traffic
+		 * open L4 RTP socket */
+		if (rs) {
+			LOGP(DCC, LOGL_ERROR, "RTP already created.\n");
+			return -EIO;
+		}
+		rs = trans->cc.rs = rtp_socket_create();
+		if (!rs) {
+			LOGP(DCC, LOGL_ERROR, "RTP socket creation failed.\n");
+			/* reply with IP/port = 0 */
+			mncc->ip = 0;
+			mncc->port = 0;
+			mncc_recvmsg(net, trans, MNCC_RTP_CREATE, (struct gsm_mncc *)mncc);
+			return -EIO;
+		}
+		rs->rx_action = RTP_RECV_L4;
+		rs->receive.net = net;
+		rs->receive.callref = callref;
+		/* reply with bound IP/port */
+		mncc->ip = ntohl(rs->rtp.sin_local.sin_addr.s_addr);
+		mncc->port = ntohs(rs->rtp.sin_local.sin_port);
+		mncc_recvmsg(net, trans, MNCC_RTP_CREATE, (struct gsm_mncc *)mncc);
+		break;
+	case MNCC_RTP_CONNECT:
+		if (!rs) {
+			LOGP(DCC, LOGL_ERROR, "RTP not created.\n");
+			return -EIO;
+		}
+		rc = rtp_socket_connect(trans->cc.rs, mncc->ip, mncc->port);
+		if (rc < 0) {
+			LOGP(DCC, LOGL_ERROR, "RTP socket connect failed.\n");
+			/* reply with IP/port = 0 */
+			mncc->ip = 0;
+			mncc->port = 0;
+			mncc_recvmsg(net, trans, MNCC_RTP_CONNECT, (struct gsm_mncc *)mncc);
+			return -EIO;
+		}
+		rs->receive.msg_type = mncc->payload_msg_type;
+		rs->receive.payload_type = mncc->payload_type;
+		/* reply with local IP/port */
+		mncc->ip = ntohl(rs->rtp.sin_local.sin_addr.s_addr);
+		mncc->port = ntohs(rs->rtp.sin_local.sin_port);
+		mncc_recvmsg(net, trans, MNCC_RTP_CONNECT, (struct gsm_mncc *)mncc);
+		break;
+	case MNCC_RTP_FREE:
+		if (!rs) {
+			LOGP(DCC, LOGL_ERROR, "RTP not created.\n");
+			return -EIO;
+		}
+		rtp_socket_free(trans->cc.rs);
+		trans->cc.rs = NULL;
+		/* reply */
+		mncc_recvmsg(net, trans, MNCC_RTP_FREE, (struct gsm_mncc *)mncc);
+		break;
+	}
+
+	return 0;
+}
+
+/* handle tch frame from L4  */
+int tch_frame_down(struct gsm_network *net, uint32_t callref, struct gsm_data_frame *data)
+{
+	struct gsm_trans *trans;
+	struct gsm_bts *bts;
+
+	/* Find callref */
+	trans = trans_find_by_callref(net, data->callref);
+	if (!trans) {
+		LOGP(DMNCC, LOGL_ERROR, "TCH frame for non-existing trans\n");
+		return -EIO;
+	}
+	if (!trans->conn) {
+		LOGP(DMNCC, LOGL_NOTICE, "TCH frame for trans without conn\n");
+		return 0;
+	}
+	if (!trans->conn->lchan) {
+		LOGP(DMNCC, LOGL_NOTICE, "TCH frame for trans without lchan\n");
+		return 0;
+	}
+	if (trans->conn->lchan->type != GSM_LCHAN_TCH_F
+	 && trans->conn->lchan->type != GSM_LCHAN_TCH_H) {
+		/* This should be LOGL_ERROR or NOTICE, but
+		 * unfortuantely it happens for a couple of frames at
+		 * the beginning of every RTP connection */
+		LOGP(DMNCC, LOGL_DEBUG, "TCH frame for lchan != TCH_F/H\n");
+		return 0;
+	}
+	bts = trans->conn->lchan->ts->trx->bts;
+	switch (bts->type) {
+	case GSM_BTS_TYPE_NANOBTS:
+	case GSM_BTS_TYPE_OSMO_SYSMO:
+		if (!trans->conn->lchan->abis_ip.rtp_socket) {
+			DEBUGP(DMNCC, "TCH frame to lchan without RTP connection\n");
+			return 0;
+		}
+		if (trans->conn->lchan->abis_ip.rtp_socket->receive.callref != callref) {
+			/* Drop frame, if not our callref. This happens, if
+			 * the call is on hold or retrieved by another
+			 * transaction. */
+			return 0;
+		}
+		return rtp_send_frame(trans->conn->lchan->abis_ip.rtp_socket, data);
+	case GSM_BTS_TYPE_BS11:
+	case GSM_BTS_TYPE_RBS2000:
+	case GSM_BTS_TYPE_NOKIA_SITE:
+		return trau_send_frame(trans->conn->lchan, data);
+	default:
+		LOGP(DCC, LOGL_ERROR, "Unknown BTS type %u\n", bts->type);
+	}
+	return -EINVAL;
+}
+
 static int gsm48_cc_rx_status_enq(struct gsm_trans *trans, struct msgb *msg)
 {
 	DEBUGP(DCC, "-> STATUS ENQ\n");
@@ -1763,6 +1924,7 @@ static int gsm48_cc_rx_setup(struct gsm_trans *trans, struct msgb *msg)
 		setup.fields |= MNCC_F_BEARER_CAP;
 		gsm48_decode_bearer_cap(&setup.bearer_cap,
 				  TLVP_VAL(&tp, GSM48_IE_BEARER_CAP)-1);
+		apply_codec_restrictions(trans->conn->bts, &setup.bearer_cap);
 	}
 	/* facility */
 	if (TLVP_PRESENT(&tp, GSM48_IE_FACILITY)) {
@@ -1916,6 +2078,7 @@ static int gsm48_cc_rx_call_conf(struct gsm_trans *trans, struct msgb *msg)
 		call_conf.fields |= MNCC_F_BEARER_CAP;
 		gsm48_decode_bearer_cap(&call_conf.bearer_cap,
 				  TLVP_VAL(&tp, GSM48_IE_BEARER_CAP)-1);
+		apply_codec_restrictions(trans->conn->bts, &call_conf.bearer_cap);
 	}
 	/* cause */
 	if (TLVP_PRESENT(&tp, GSM48_IE_CAUSE)) {
@@ -2604,6 +2767,7 @@ static int gsm48_cc_rx_modify(struct gsm_trans *trans, struct msgb *msg)
 		modify.fields |= MNCC_F_BEARER_CAP;
 		gsm48_decode_bearer_cap(&modify.bearer_cap,
 				  TLVP_VAL(&tp, GSM48_IE_BEARER_CAP)-1);
+		apply_codec_restrictions(trans->conn->bts, &modify.bearer_cap);
 	}
 
 	new_cc_state(trans, GSM_CSTATE_MO_ORIG_MODIFY);
@@ -2646,6 +2810,7 @@ static int gsm48_cc_rx_modify_complete(struct gsm_trans *trans, struct msgb *msg
 		modify.fields |= MNCC_F_BEARER_CAP;
 		gsm48_decode_bearer_cap(&modify.bearer_cap,
 				  TLVP_VAL(&tp, GSM48_IE_BEARER_CAP)-1);
+		apply_codec_restrictions(trans->conn->bts, &modify.bearer_cap);
 	}
 
 	new_cc_state(trans, GSM_CSTATE_ACTIVE);
@@ -2686,6 +2851,7 @@ static int gsm48_cc_rx_modify_reject(struct gsm_trans *trans, struct msgb *msg)
 		modify.fields |= GSM48_IE_BEARER_CAP;
 		gsm48_decode_bearer_cap(&modify.bearer_cap,
 				  TLVP_VAL(&tp, GSM48_IE_BEARER_CAP)-1);
+		apply_codec_restrictions(trans->conn->bts, &modify.bearer_cap);
 	}
 	/* cause */
 	if (TLVP_PRESENT(&tp, GSM48_IE_CAUSE)) {
@@ -2792,7 +2958,8 @@ static int _gsm48_lchan_modify(struct gsm_trans *trans, void *arg)
 {
 	struct gsm_mncc *mode = arg;
 
-	return gsm0808_assign_req(trans->conn, mode->lchan_mode, 1);
+	return gsm0808_assign_req(trans->conn, mode->lchan_mode,
+		trans->conn->lchan->type != GSM_LCHAN_TCH_H);
 }
 
 static struct downstate {
@@ -2862,7 +3029,6 @@ int mncc_tx_to_cc(struct gsm_network *net, int msg_type, void *arg)
 	int i, rc = 0;
 	struct gsm_trans *trans = NULL, *transt;
 	struct gsm_subscriber_connection *conn = NULL;
-	struct gsm_bts *bts = NULL;
 	struct gsm_mncc *data = arg, rel;
 
 	DEBUGP(DMNCC, "receive message %s\n", get_mncc_name(msg_type));
@@ -2875,42 +3041,15 @@ int mncc_tx_to_cc(struct gsm_network *net, int msg_type, void *arg)
 		return tch_recv_mncc(net, data->callref, 0);
 	case MNCC_FRAME_RECV:
 		return tch_recv_mncc(net, data->callref, 1);
+	case MNCC_RTP_CREATE:
+	case MNCC_RTP_CONNECT:
+	case MNCC_RTP_FREE:
+		return mncc_rtp(net, data->callref, (struct gsm_mncc_rtp *) arg);
 	case GSM_TCHF_FRAME:
 	case GSM_TCHF_FRAME_EFR:
-		/* Find callref */
-		trans = trans_find_by_callref(net, data->callref);
-		if (!trans) {
-			LOGP(DMNCC, LOGL_ERROR, "TCH frame for non-existing trans\n");
-			return -EIO;
-		}
-		if (!trans->conn) {
-			LOGP(DMNCC, LOGL_NOTICE, "TCH frame for trans without conn\n");
-			return 0;
-		}
-		if (trans->conn->lchan->type != GSM_LCHAN_TCH_F) {
-			/* This should be LOGL_ERROR or NOTICE, but
-			 * unfortuantely it happens for a couple of frames at
-			 * the beginning of every RTP connection */
-			LOGP(DMNCC, LOGL_DEBUG, "TCH frame for lchan != TCH_F\n");
-			return 0;
-		}
-		bts = trans->conn->lchan->ts->trx->bts;
-		switch (bts->type) {
-		case GSM_BTS_TYPE_NANOBTS:
-		case GSM_BTS_TYPE_OSMO_SYSMO:
-			if (!trans->conn->lchan->abis_ip.rtp_socket) {
-				DEBUGP(DMNCC, "TCH frame to lchan without RTP connection\n");
-				return 0;
-			}
-			return rtp_send_frame(trans->conn->lchan->abis_ip.rtp_socket, arg);
-		case GSM_BTS_TYPE_BS11:
-		case GSM_BTS_TYPE_RBS2000:
-		case GSM_BTS_TYPE_NOKIA_SITE:
-			return trau_send_frame(trans->conn->lchan, arg);
-		default:
-			LOGP(DCC, LOGL_ERROR, "Unknown BTS type %u\n", bts->type);
-		}
-		return -EINVAL;
+	case GSM_TCHH_FRAME:
+	case GSM_TCH_FRAME_AMR:
+		return tch_frame_down(net, data->callref, (struct gsm_data_frame *) arg);
 	}
 
 	memset(&rel, 0, sizeof(struct gsm_mncc));
@@ -2987,6 +3126,8 @@ int mncc_tx_to_cc(struct gsm_network *net, int msg_type, void *arg)
 
 		/* If subscriber has no lchan */
 		if (!conn) {
+			uint8_t type;
+
 			/* find transaction with this subscriber already paging */
 			llist_for_each_entry(transt, &net->trans_list, entry) {
 				/* Transaction of our lchan? */
@@ -3016,7 +3157,18 @@ int mncc_tx_to_cc(struct gsm_network *net, int msg_type, void *arg)
 			}
 
 			*trans->paging_request = subscr->net;
-			subscr_get_channel(subscr, RSL_CHANNEED_TCH_F, setup_trig_pag_evt, trans->paging_request);
+
+			switch (data->lchan_type) {
+			case GSM_LCHAN_TCH_F:
+				type = RSL_CHANNEED_TCH_F;
+				break;
+			case GSM_LCHAN_TCH_H:
+				type = RSL_CHANNEED_TCH_ForH;
+				break;
+			default:
+				type = RSL_CHANNEED_SDCCH;
+			}
+			subscr_get_channel(subscr, type, setup_trig_pag_evt, trans->paging_request);
 
 			subscr_put(subscr);
 			return 0;

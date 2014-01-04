@@ -538,8 +538,8 @@ int rsl_chan_activate_lchan(struct gsm_lchan *lchan, uint8_t act_type,
 	msgb_tv_put(msg, RSL_IE_TIMING_ADVANCE, ta);
 
 	if (lchan->tch_mode == GSM48_CMODE_SPEECH_AMR)
-		msgb_tlv_put(msg, RSL_IE_MR_CONFIG, sizeof(lchan->mr_conf),
-			     (uint8_t *) &lchan->mr_conf);
+		msgb_tlv_put(msg, RSL_IE_MR_CONFIG, lchan->mr_bts_lv[0],
+			     lchan->mr_bts_lv + 1);
 
 	msg->dst = lchan->ts->trx->rsl_link;
 
@@ -575,10 +575,11 @@ int rsl_chan_mode_modify_req(struct gsm_lchan *lchan)
 			msgb_tlv_put(msg, RSL_IE_ENCR_INFO, rc, encr_info);
 	}
 
-	if (lchan->tch_mode == GSM48_CMODE_SPEECH_AMR) {
-		msgb_tlv_put(msg, RSL_IE_MR_CONFIG, sizeof(lchan->mr_conf),
-			     (uint8_t *) &lchan->mr_conf);
-	}
+	if (lchan->tch_mode == GSM48_CMODE_SPEECH_AMR)
+{
+		msgb_tlv_put(msg, RSL_IE_MR_CONFIG, lchan->mr_bts_lv[0],
+			     lchan->mr_bts_lv + 1);
+}
 
 	msg->dst = lchan->ts->trx->rsl_link;
 
@@ -1384,6 +1385,12 @@ static int rsl_rx_chan_rqd(struct msgb *msg)
 
 	/* check availability / allocate channel */
 	lchan = lchan_alloc(bts, lctype, is_lu);
+	if (!lchan && (rqd_ref->ra & 0xf0) == 0x30) {
+		LOGP(DRSL, LOGL_NOTICE, "BTS %d CHAN RQD: no resources for %s 0x%x, retrying with %s\n",
+		     msg->lchan->ts->trx->bts->nr, gsm_lchant_name(lctype), rqd_ref->ra, gsm_lchant_name(GSM_LCHAN_TCH_F));
+		lctype = GSM_LCHAN_TCH_F;
+		lchan = lchan_alloc(bts, lctype, is_lu);
+	}
 	if (!lchan) {
 		LOGP(DRSL, LOGL_NOTICE, "BTS %d CHAN RQD: no resources for %s 0x%x\n",
 		     msg->lchan->ts->trx->bts->nr, gsm_lchant_name(lctype), rqd_ref->ra);
@@ -1887,6 +1894,11 @@ int rsl_ipacc_mdcx_to_rtpsock(struct gsm_lchan *lchan)
 {
 	struct rtp_socket *rs = lchan->abis_ip.rtp_socket;
 	int rc;
+
+	if (!rs) {
+		LOGP(DRSL, LOGL_ERROR, "LCHAN has not rtp_socket\n");
+		return -EINVAL;
+	}
 
 	rc = rsl_ipacc_mdcx(lchan, ntohl(rs->rtp.sin_local.sin_addr.s_addr),
 				ntohs(rs->rtp.sin_local.sin_port),

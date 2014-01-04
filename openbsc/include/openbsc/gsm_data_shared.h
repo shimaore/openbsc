@@ -143,10 +143,19 @@ struct bts_ul_meas {
 	uint8_t inv_rssi;
 };
 
+struct bts_codec_conf {
+	uint8_t hr;
+	uint8_t efr;
+	uint8_t afs;
+	uint8_t ahs;
+};
+
 struct amr_mode {
 	uint8_t mode;
-	uint8_t threshold;
-	uint8_t hysteresis;
+	uint8_t threshold_ms;
+	uint8_t hysteresis_ms;
+	uint8_t threshold_bts;
+	uint8_t hysteresis_bts;
 };
 struct amr_multirate_conf {
 	uint8_t gsm48_ie[2];
@@ -201,7 +210,8 @@ struct gsm_lchan {
 	} encr;
 
 	/* AMR bits */
-	struct gsm48_multi_rate_conf mr_conf;
+	uint8_t mr_ms_lv[7];
+	uint8_t mr_bts_lv[7];
 
 	/* Established data link layer services */
 	uint8_t sapis[8];
@@ -704,6 +714,13 @@ struct gsm_bts {
 
 	/* exclude the BTS from the global RF Lock handling */
 	int excl_from_rf_lock;
+
+	/* supported codecs beside FR */
+	struct bts_codec_conf codec;
+
+	/* full and half rate multirate config */
+	struct amr_multirate_conf mr_full;
+	struct amr_multirate_conf mr_half;
 #endif /* ROLE_BSC */
 	void *role;
 };

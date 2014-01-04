@@ -44,6 +44,10 @@ struct gsm_call {
 	uint32_t callref;
 	/* the 'remote' transaction */
 	uint32_t remote_ref;
+
+	/* the capabilities */
+	uint8_t lchan_type;
+	struct gsm_mncc_bearer_cap bcap;
 };
 
 #define MNCC_SETUP_REQ		0x0101
@@ -92,10 +96,16 @@ struct gsm_call {
 #define MNCC_FRAME_RECV		0x0201
 #define MNCC_FRAME_DROP		0x0202
 #define MNCC_LCHAN_MODIFY	0x0203
+#define MNCC_RTP_CREATE		0x0204
+#define MNCC_RTP_CONNECT	0x0205
+#define MNCC_RTP_FREE		0x0206
 
 #define GSM_TCHF_FRAME		0x0300
 #define GSM_TCHF_FRAME_EFR	0x0301
 #define GSM_TCHF_BAD_FRAME	0x03ff
+#define GSM_TCHH_FRAME		0x0302
+#define GSM_TCH_FRAME_AMR	0x0303
+#define GSM_BAD_FRAME		0x03ff
 
 #define MNCC_SOCKET_HELLO	0x0400
 
@@ -177,6 +187,15 @@ struct gsm_mncc_hello {
 	uint32_t	lchan_type_offset;
 };
 
+struct gsm_mncc_rtp {
+	uint32_t	msg_type;
+	uint32_t	callref;
+	uint32_t	ip;
+	uint16_t	port;
+	uint32_t	payload_type;
+	uint32_t	payload_msg_type;
+};
+
 char *get_mncc_name(int value);
 void mncc_set_cause(struct gsm_mncc *data, int loc, int val);
 void cc_tx_to_mncc(struct gsm_network *net, struct msgb *msg);
@@ -188,5 +207,13 @@ int int_mncc_recv(struct gsm_network *net, struct msgb *msg);
 int mncc_sock_from_cc(struct gsm_network *net, struct msgb *msg);
 
 int mncc_sock_init(struct gsm_network *gsmnet);
+
+#define mncc_is_data_frame(msg_type) \
+	(msg_type == GSM_TCHF_FRAME \
+		|| msg_type == GSM_TCHF_FRAME_EFR \
+		|| msg_type == GSM_TCHH_FRAME \
+		|| msg_type == GSM_TCH_FRAME_AMR \
+		|| msg_type == GSM_BAD_FRAME)
+
 
 #endif

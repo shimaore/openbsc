@@ -205,12 +205,14 @@ static struct gbprox_peer *peer_alloc(uint16_t bvci)
 	return peer;
 }
 
+#if 0
 static void peer_free(struct gbprox_peer *peer)
 {
 	rate_ctr_group_free(peer->ctrg);
 	llist_del(&peer->list);
 	talloc_free(peer);
 }
+#endif
 
 /* FIXME: this needs to go to libosmocore/msgb.c */
 static struct msgb *msgb_copy(const struct msgb *msg, const char *name)
