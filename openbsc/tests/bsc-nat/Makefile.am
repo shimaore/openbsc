@@ -18,6 +18,8 @@ bsc_nat_test_LDADD = $(top_builddir)/src/libbsc/libbsc.a \
 			$(top_builddir)/src/libctrl/libctrl.a \
 			$(top_builddir)/src/libmgcp/libmgcp.a \
 			$(top_builddir)/src/libtrau/libtrau.a \
+			$(top_builddir)/src/libmsc/libmsc.a -ldbi \
+			$(top_builddir)/src/libtrau/libtrau.a \
 			$(top_builddir)/src/libcommon/libcommon.a \
 			$(LIBOSMOCORE_LIBS) $(LIBOSMOGSM_LIBS) -lrt \
 			$(LIBOSMOSCCP_LIBS) $(LIBOSMOVTY_LIBS) \
